@@ -25,7 +25,6 @@ Detects potential issues by looking for reflection of unique canaries, response 
 ```bash
 git clone https://github.com/YOUR-USERNAME/web-cache-vuln-tool.git
 cd web-cache-vuln-tool
-```bash
 
 2. Install dependencies (only requests is required):
 
