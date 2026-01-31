@@ -23,7 +23,7 @@ Detects potential issues by looking for reflection of unique canaries, response 
 1. Clone the repository:
 
 ```
-git clone https://github.com/YOUR-USERNAME/web-cache-vuln-tool.git
+git clone https://github.com/shirkirtia-art/web-cache-vuln-tool.git
 cd web-cache-vuln-tool
 ```
 2. Install dependencies (only requests is required):
