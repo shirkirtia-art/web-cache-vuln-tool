@@ -22,29 +22,30 @@ Detects potential issues by looking for reflection of unique canaries, response 
 
 1. Clone the repository:
 
-```bash
+```
 git clone https://github.com/YOUR-USERNAME/web-cache-vuln-tool.git
 cd web-cache-vuln-tool
-
+```
 2. Install dependencies (only requests is required):
-
+```
 pip install requests
 # or
 python -m pip install requests
-
+```
 Usage
 Single URL
-
+```
 python cache_scanner.py -u https://example.com/style.css
-
+```
 Scan multiple URLs from file
 Create targets.txt with one URL per line:
-
+```
 https://example.com/
 https://example.com/assets/main.js
 https://example.com/blog/post-123
-
+```
 Then run:
+```
 # Basic scan (5 threads)
 python cache_scanner.py -f targets.txt -n 5
 
@@ -53,9 +54,9 @@ python cache_scanner.py -f targets.txt --delay 1.5 -n 4
 
 # Continue testing even after finding issues
 python cache_scanner.py -f targets.txt --continue
-
+```
 Available options
-
+```
 --file, -f      File with URLs (one per line)
 --url, -u       Single URL to test
 --threads, -n   Number of concurrent targets (default: 5)
@@ -64,9 +65,9 @@ Available options
 --cache-hits    File for cached URLs (default: cache_hits.txt)
 --suspect       File for potentially vulnerable URLs (default: suspect_urls.txt)
 --continue      Keep testing after finding a suspect case
-
+```
 Example Output
-
+```
 ================================================================================
 [Starting analysis for URL: https://example.com/community/redirect/tutorial-on-loops]
 ================================================================================
@@ -80,9 +81,9 @@ testing-Params : https://example.com/cdn-cgi/styles/cf.errors.css?callback=poiso
 ...
 testing-with-paths : https://example.com/cdn-cgi/styles/cf.errors.css trailing-slash-add ... no-here
 ...
-
+```
 When something suspicious is found:
-
+```
 testing-Headers : https://example.com/api/v1/data -H X-Forwarded-Host:poison_123456 ... bounty
 Here is your bounty: Cache poisoning hit using Headers X-Forwarded-Host
 Poisoned URL/Path: https://example.com/api/v1/data
