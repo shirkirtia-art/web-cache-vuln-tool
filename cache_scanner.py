@@ -1,181 +1,522 @@
-#!/usr/bin/env python3
-"""
-Cache Poisoning / Deception Scanner
-Inspired by autopoisoner + output style like modern web cache tools
-Supports batch from file + multithreading
-"""
-
-import argparse
-import random
-import time
-import threading
-import json
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
 import requests
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, Tuple, Optional
+from urllib.parse import urlparse, urljoin, quote
+import json
+import time
+import random
+import argparse
 
-# ────────────────────────────────────────────────
-#  Configuration
-# ────────────────────────────────────────────────
+WARNING = """
+WARNING: This tool is for authorized bug bounty testing only.
+Use on targets you have permission for.
+"""
+print(WARNING)
 
-CANARY_BASE = "poison"
-TIMEOUT = 12
-DELAY_BETWEEN = 0.6          # seconds between requests to same target
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_file')
+    parser.add_argument('--headers-only', action='store_true')
+    parser.add_argument('--params-only', action='store_true')
+    parser.add_argument('--threads', type=int, default=5)
+    parser.add_argument('--delay', type=float, default=1.0)
+    parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--user-agent', default='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+    return parser.parse_args()
 
-HEADERS_TO_TEST = [
-    "X-Forwarded-Host", "X-Host", "X-Original-URL", "X-Rewrite-URL",
-    "X-Forwarded-Proto", "X-Forwarded-Scheme", "X-Original-Host",
-    "Forwarded", "X-HTTP-Method-Override", "X-Amz-Website-Redirect-Location",
-    "X-Forwarded-Prefix", "Host", "Referer", "Origin"
+args = parse_args()
+
+with open(args.input_file, 'r') as f:
+    urls = [line.strip() for line in f if line.strip()]
+
+cache_headers = ['X-Cache', 'CF-Cache-Status', 'Age', 'Via', 'X-Served-By', 'X-Proxy-Cache', 'X-Akamai-Cache-Status', 'Server-Timing', 'Fastly-Cache', 'CDN-Cache']
+
+def get_cache_headers(resp):
+    return {h: resp.headers.get(h, '') for h in cache_headers if h in resp.headers}
+
+def get_cache_status(headers):
+    # Original logic preserved but we'll use it differently later
+    
+    if 'CF-Cache-Status' in headers:
+        status = headers['CF-Cache-Status'].upper()
+        if status in ['HIT', 'REVALIDATED', 'UPDATING']:
+            return 'HIT'
+        elif status in ['MISS', 'BYPASS', 'EXPIRED', 'DYNAMIC', 'BYPASS+MISS', 'BYPASS+HIT']:
+            return 'MISS'
+    
+    if 'X-Cache' in headers:
+        xc = headers['X-Cache'].upper()
+        if any(x in xc for x in ['HIT', 'HIT FROM', 'CACHED']):
+            return 'HIT'
+        elif any(x in xc for x in ['MISS', 'MISS FROM', 'BYPASS', 'UNCACHEABLE']):
+            return 'MISS'
+    
+    if 'X-Proxy-Cache' in headers:
+        xpc = headers['X-Proxy-Cache'].upper()
+        if 'HIT' in xpc:
+            return 'HIT'
+        elif any(x in xpc for x in ['MISS', 'BYPASS']):
+            return 'MISS'
+    
+    # Very common fallback — if Age > 0 → almost certainly HIT
+    if 'Age' in headers and headers['Age'].isdigit() and int(headers['Age']) > 0:
+        return 'HIT'
+    
+    # Some CDNs / proxies
+    if 'X-Cacheable' in headers:
+        if 'YES' in headers['X-Cacheable'].upper() or 'TRUE' in headers['X-Cacheable'].upper():
+            return 'HIT'
+    
+    return 'UNKNOWN'
+
+def detect_cdn(headers):
+    lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
+    if 'cf-ray' in lower_headers or 'cf-cache-status' in lower_headers:
+        return 'Cloudflare'
+    if 'x-amz-cf-id' in lower_headers or ('server' in lower_headers and 'cloudfront' in lower_headers['server']):
+        return 'CloudFront'
+    if 'fastly-cache' in lower_headers or 'x-served-by' in lower_headers and 'fastly' in lower_headers['x-served-by']:
+        return 'Fastly'
+    if 'x-akamai-cache-status' in lower_headers or ('via' in lower_headers and 'akamai' in lower_headers['via']):
+        return 'Akamai'
+    if ('via' in lower_headers and 'varnish' in lower_headers['via']) or 'x-varnish' in lower_headers:
+        return 'Varnish'
+    return 'Unknown'
+
+user_agent = args.user_agent
+headers_base = {'User-Agent': user_agent}
+
+def make_request(url, extra_headers=None, timeout=args.timeout, retries=3):
+    h = headers_base.copy()
+    if extra_headers:
+        h.update(extra_headers)
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=h, timeout=timeout, allow_redirects=True)
+            return resp
+        except requests.exceptions.Timeout:
+            print(f"\033[31m[TIMEOUT] {url} attempt {attempt+1}\033[0m")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"\033[31m[ERROR] {url}: {e}\033[0m")
+            return None
+    print(f"\033[31m[REQUEST FAILED AFTER RETRIES] {url}\033[0m")
+    return None
+
+def body_hash(resp):
+    if resp:
+        return hashlib.sha256(resp.content).hexdigest()
+    return ''
+
+headers_to_test = [
+    'X-Forwarded-Host',
+    'X-Host',
+    'X-Original-URL',
+    'X-Rewrite-URL',
+    'X-Forwarded-Proto',
+    'Forwarded',
+    'X-HTTP-Method-Override'
 ]
 
-PARAMS_TO_TEST = [
-    "cb", "cachebuster", "v", "_", "t", "test", "debug", "utm_source",
-    "utm_medium", "lang", "format", "callback"
+params_to_test = [
+    'cb',
+    'cachebuster',
+    'utm_source',
+    'test',
+    'debug',
+    'lang',
+    'format',
+    'callback'
 ]
 
-PATH_VARIATIONS = {
-    "trailing-slash-add":    lambda p: p._replace(path=p.path.rstrip('/') + '/'),
-    "trailing-slash-remove": lambda p: p._replace(path=p.path.rstrip('/')),
-    "double-slash":          lambda p: p._replace(path='//' + p.path.lstrip('/')),
-    "encoded-slash":         lambda p: p._replace(path=p.path.replace('/', '%2f')),
-    "upper-path":            lambda p: p._replace(path=p.path.upper()),
-    # You can add more: append_.css, /../test, etc.
-}
+variations = [
+    ('trailing_slash_add', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/')),
+    ('trailing_slash_remove', lambda p: urljoin(p.geturl(), p.path.rstrip('/'))),
+    ('double_slash', lambda p: p._replace(path=p.path.replace('/', '//', 1)).geturl()),
+    ('encoded_slash', lambda p: p._replace(path=quote(p.path, safe='')).geturl()),
+    ('upper_path', lambda p: p._replace(path=p.path.upper()).geturl()),
+    ('path_param_semicolon', lambda p: urljoin(p.geturl(), p.path + ';test=1')),
+    ('append_js', lambda p: p._replace(path=p.path.rstrip('/') + '.js').geturl()),
+    ('append_css', lambda p: p._replace(path=p.path.rstrip('/') + '.css').geturl()),
+    ('append_json', lambda p: p._replace(path=p.path.rstrip('/') + '.json').geturl()),
+    ('append_png', lambda p: p._replace(path=p.path.rstrip('/') + '.png').geturl()),
+    ('append_ico', lambda p: p._replace(path=p.path.rstrip('/') + '.ico').geturl()),
+    ('append_avif', lambda p: p._replace(path=p.path.rstrip('/') + '.avif').geturl()),
+    ('append_webp', lambda p: p._replace(path=p.path.rstrip('/') + '.webp').geturl()),
+    ('append_bak', lambda p: p._replace(path=p.path.rstrip('/') + '.bak').geturl()),
+    ('append_old', lambda p: p._replace(path=p.path.rstrip('/') + '.old').geturl()),
+    ('append_backup', lambda p: p._replace(path=p.path.rstrip('/') + '.backup').geturl()),
+    ('append_admin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/admin')),
+    ('append_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data')),
+    ('append_page_data_json', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data.json')),
+    ('append_dash_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data/')),
+    ('append_backup', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/backup')),
+    ('append_config', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/config')),
+    ('append_debug', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/debug')),
+    ('append_api', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/api')),
+    ('append_login', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/login')),
+    ('append_fake_css', lambda p: p._replace(path=p.path + '/fake.css').geturl()),
+    ('append_fake_js', lambda p: p._replace(path=p.path + '/nonexistent.js').geturl()),
+    ('append_style_css', lambda p: p._replace(path=p.path + '/style.css').geturl()),
+    ('append_main_js', lambda p: p._replace(path=p.path + '/main.js').geturl()),
+    ('append_index_html', lambda p: p._replace(path=p.path + '/index.html').geturl()),
+    ('append_extra_dir', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/extra/')),
+    ('append_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/../')),
+    ('append_encoded_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/%2e%2e/')),
+    ('append_many_slashes', lambda p: p._replace(path=p.path + '///').geturl()),
+    ('append_admin_css', lambda p: p._replace(path=p.path.rstrip('/') + '/admin.css').geturl()),
+    ('append_backup_json', lambda p: p._replace(path=p.path.rstrip('/') + '/backup.json').geturl()),
+    ('append_config_yaml', lambda p: p._replace(path=p.path.rstrip('/') + '/config.yaml').geturl()),
+    ('append_env', lambda p: p._replace(path=p.path.rstrip('/') + '/.env').geturl()),
+    ('append_git', lambda p: p._replace(path=p.path.rstrip('/') + '/.git').geturl()),
+    ('append_sitemap_xml', lambda p: p._replace(path=p.path.rstrip('/') + '/sitemap.xml').geturl()),
+    ('append_robots_txt', lambda p: p._replace(path=p.path.rstrip('/') + '/robots.txt').geturl()),
+    ('append_test_php', lambda p: p._replace(path=p.path.rstrip('/') + '/test.php').geturl()),
+    ('append_index_php', lambda p: p._replace(path=p.path.rstrip('/') + '/index.php').geturl()),
+    ('append_wp_admin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/wp-admin')),
+    ('append_dashboard', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/dashboard')),
+    ('append_profile', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/profile')),
+    ('append_settings', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/settings')),
+    ('append_logs', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/logs')),
+    ('append_db_dump', lambda p: p._replace(path=p.path.rstrip('/') + '/db_dump.sql').geturl()),
+    ('append_cache', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/cache')),
+    ('append_static', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/static')),
+    ('append_assets', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/assets')),
+    ('append_images', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/images')),
+    ('append_scripts', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/scripts')),
+    ('append_styles', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/styles')),
+    ('append_fonts', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/fonts')),
+    ('append_vendor', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/vendor')),
+    ('append_node_modules', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/node_modules')),
+    ('append_composer_json', lambda p: p._replace(path=p.path.rstrip('/') + '/composer.json').geturl()),
+    ('append_package_json', lambda p: p._replace(path=p.path.rstrip('/') + '/package.json').geturl()),
+    ('append_manifest_json', lambda p: p._replace(path=p.path.rstrip('/') + '/manifest.json').geturl()),
+    ('append_sw_js', lambda p: p._replace(path=p.path.rstrip('/') + '/sw.js').geturl()),
+    ('append_favicon_ico', lambda p: p._replace(path=p.path.rstrip('/') + '/favicon.ico').geturl()),
+    ('append_apple_touch_icon', lambda p: p._replace(path=p.path.rstrip('/') + '/apple-touch-icon.png').geturl()),
+]
 
-# ────────────────────────────────────────────────
-#  Helpers
-# ────────────────────────────────────────────────
+additional_suffixes = [
+    "#?",
+    "%09",
+    "%09%3b",
+    "%09..",
+    "%09;",
+    "%20",
+    "%23",
+    "%23%3f",
+    "%252f%252f",
+    "%252f/",
+    "%2e%2e",
+    "%2e%2e/",
+    "%2f",
+    "%2f%20%23",
+    "%2f%23",
+    "%2f%2f",
+    "%2f%3b%2f",
+    "%2f%3b%2f%2f",
+    "%2f%3f",
+    "%2f%3f/",
+    "%2f/",
+    "%2f;?",
+    "%2f?;",
+    "%3b",
+    "%3b%09",
+    "%3b%2f%2e%2e",
+    "%3b%2f%2e%2e%2f%2e%2e%2f%2f",
+    "%3b%2f%2e.",
+    "%3b%2f..",
+    "%3b/%2e%2e/..%2f%2f",
+    "%3b/%2e.",
+    "%3b/%2f%2f../",
+    "%3b/..",
+    "%3b//%2f../",
+    "%3f%23",
+    "%3f%3f",
+    "%3f.php",
+    "..",
+    "..%00/",
+    "..%00/;",
+    "..%00;/",
+    "..%09",
+    "..%0d/",
+    "..%0d/;",
+    "..%0d;/",
+    "..%5c/",
+    "..%ff/",
+    "..%ff/;",
+    "..%ff;/",
+    "../",
+    "..;%00/",
+    "..;%0d/",
+    "..;%ff/",
+    "..;\\",
+    "..;\\;",
+    "..\\",
+    "..\\;",
+    ".html",
+    ".json",
+    "/",
+    "/#",
+    "/%20",
+    "/%20#",
+    "/%20%23",
+    "/%23",
+    "/%252e%252e%252f/",
+    "/%252e%252e%253b/",
+    "/%252e%252f/",
+    "/%252e%253b/",
+    "/%252e/",
+    "/%252f",
+    "/%2e%2e",
+    "/%2e%2e%2f/",
+    "/%2e%2e%3b/",
+    "/%2e%2e/",
+    "/%2e%2f/",
+    "/%2e%3b/",
+    "/%2e%3b//",
+    "/%2e/",
+    "/%2e//",
+    "/%2f",
+    "/%3b/",
+    "/..",
+    "/..%2f",
+    "/..%2f..%2f",
+    "/..%2f..%2f..%2f",
+    "/../",
+    "/../../",
+    "/../../../",
+    "/../../../",
+    "/../../",
+    "/../.././../",
+    "/../../../",
+    "/.././../",
+    "/../.;/../",
+    "/..//",
+    "/..//../",
+    "/..//../../",
+    "/..//..;/",
+    "/../;/",
+    "/../;/../",
+    "/..;%2f",
+    "/..;%2f..;%2f",
+    "/..;%2f..;%2f..;%2f",
+    "/..;/",
+    "/..;/../",
+    "/..;/..;/",
+    "/..;//",
+    "/..;//../",
+    "/..;//..;/",
+    "/..;/;/",
+    "/..;/;/..;/",
+    "/./",
+    "/.//",
+    "/.;/",
+    "/.;//",
+    "//..",
+    "//../../",
+    "//..;",
+    "//./",
+    "//.;/",
+    "///..",
+    "///../",
+    "///..//",
+    "/;/",
+    "/;/",
+    "/;//",
+    "/;?",
+    "/;x",
+    "/;x/",
+    "/?",
+    "/?;",
+    "/x/../",
+    "/x/..//",
+    "/x/../;/",
+    "/x/..;/",
+    "/x/..;//",
+    "/x/..;/;/",
+    "/x//../",
+    "/x//..;/",
+    "/x/;/../",
+    "/x/;/..;/",
+    ";",
+    ";%09",
+    ";%09..",
+    ";%09..;",
+    ";%09;",
+    ";%2F..",
+    ";%2f%2e%2e",
+    ";%2f%2e%2e%2f%2e%2e%2f%2f",
+    ";%2f%2f/../",
+    ";%2f..",
+    ";%2f..%2f%2e%2e%2f%2f",
+    ";%2f..%2f..%2f%2f",
+    ";%2f..%2f/",
+    ";%2f..%2f/..%2f",
+    ";%2f..%2f/../",
+    ";%2f../%2f..%2f",
+    ";%2f../%2f../",
+    ";%2f..//..%2f",
+    ";%2f..//../",
+    ";%2f..///",
+    ";%2f..///;",
+    ";%2f..//;/",
+    ";%2f..//;/;",
+    ";%2f../;//",
+    ";%2f../;/;/",
+    ";%2f../;/;/;",
+    ";%2f..;///",
+    ";%2f..;//;/",
+    ";%2f..;/;//",
+    ";%2f/%2f../",
+    ";%2f//..%2f",
+    ";%2f//../",
+    ";%2f//..;/",
+    ";%2f/;/../",
+    ";%2f/;/..;/",
+    ";%2f;//../",
+    ";%2f;/;/..;/",
+    ";/%2e%2e",
+    ";/%2e%2e%2f%2f",
+    ";/%2e%2e%2f/",
+    ";/%2e%2e/",
+    ";/%2e.",
+    ";/%2f%2f../",
+    ";/%2f/..%2f",
+    ";/%2f/../",
+    ";/.%2e",
+    ";/.%2e/%2e%2e/%2f",
+    ";/..",
+    ";/..%2f",
+    ";/..%2f%2f../",
+    ";/..%2f..%2f",
+    ";/..%2f/",
+    ";/..%2f//",
+    ";/../",
+    ";/../%2f/",
+    ";/../../",
+    ";/../../",
+    ";/.././../",
+    ";/../.;/../",
+    ";/../",
+    ";/..//%2e%2e/",
+    ";/..//%2f",
+    ";/..//../",
+    ";/..///",
+    ";/../;/",
+    ";/../;/../",
+    ";/..;",
+    ";/.;.",
+    ";//%2f../",
+    ";//..",
+    ";//../../",
+    ";///..",
+    ";///../",
+    ";///..//",
+    ";?",
+    ";x",
+    ";x/",
+    ";x;",
+    "?",
+    "?#",
+    "?.php",
+    "?;",
+    "??",
+    "///",
+    "/%2f/",
+    "//%2f",
+    "%2f/%2f",
+    "%2f%2f%2f",
+    "%2f//",
+]
 
-def random_suffix() -> str:
-    return f"{CANARY_BASE}_{random.randint(100000, 999999)}"
+def sanitize_name(s):
+    table = str.maketrans({
+        '%': 'pct',
+        '/': 'slash',
+        ';': 'semi',
+        '.': 'dot',
+        '#': 'hash',
+        '?': 'q',
+        '\\': 'backslash',
+        ' ': 'space',
+    })
+    return s.translate(table)
 
+variations += [
+    (f'append_{sanitize_name(s)}', lambda p, suff=s: p._replace(path=p.path + suff).geturl()) for s in additional_suffixes
+]
 
-def make_request(url: str, headers: Optional[Dict] = None, timeout: int = TIMEOUT) -> Optional[requests.Response]:
-    try:
-        return requests.get(
-            url,
-            headers=headers or {},
-            timeout=timeout,
-            allow_redirects=False
-        )
-    except (requests.RequestException, KeyboardInterrupt):
-        return None
-
-
-def get_cache_indicators(headers: Dict) -> Dict[str, Any]:
-    indicators = {}
-    for h in ["X-Cache", "X-Cache-Hits", "Age", "Cf-Cache-Status", "X-Cache-Status"]:
-        if h.lower() in (k.lower() for k in headers):
-            indicators[h] = headers.get(h) or headers.get(h.lower())
-    return indicators
-
-
-def looks_cached(headers: Dict) -> bool:
-    cache_status = headers.get("Cf-Cache-Status", "").lower()
-    if cache_status in ["hit", "hit-from-origin", "dynamic"]:
-        return True
-    if "age" in headers and int(headers.get("Age", 0)) > 0:
-        return True
-    if "x-cache" in (k.lower() for k in headers) and "hit" in headers.get("X-Cache", "").lower():
-        return True
-    return False
-
-
-def body_fingerprint(resp: requests.Response) -> str:
-    if not resp or not resp.text:
-        return ""
-    # Very simple hash — in production you might use xxhash or simhash
-    return str(hash(resp.text[:8000]))
-
-
-# ────────────────────────────────────────────────
-#  Core test function
-# ────────────────────────────────────────────────
-
-def perform_test(url: str, test_type: str, key: str = "", variation_func=None) -> Tuple[Dict, bool]:
-    result: Dict[str, Any] = {
-        "url": url,
-        "test_type": test_type,
-        "key": key,
-        "poisoned_url": url,
-        "extra_headers": {},
-        "cache_status": "UNKNOWN",
-        "reflected": False,
-        "hash_changed": False,
-        "status_code": 0,
+def perform_test(url, test_type, key=None, variation_func=None):
+    unique = f"poison_{random.randint(100000, 999999)}"
+    parsed = urlparse(url)
+    result = {
+        'url': url,
+        'test_type': test_type,
+        'header_used': key if test_type == 'header' else '',
+        'param_used': key if test_type == 'param' else '',
+        'variation_used': key if test_type == 'variation' else '',
+        'poisoned_url': '',
+        'unique_poison': unique,
+        'extra_headers': {},
+        'cache_status': '',
+        'reflected': False,
+        'hash_changed': False,
+        'cdn': 'Unknown',
+        'status_code': 0,
+        'cache_headers': {}
     }
-
-    unique = random_suffix()
+    extra_h = {}
     poisoned_url = url
     poisoned_desc = url
-    extra_h = {}
-
-    parsed = urlparse(url)
-
-    if test_type == "Headers":
+    if test_type == 'Headers':
         extra_h = {key: unique}
         poisoned_desc = f"{url} -H {key}:{unique}"
-    elif test_type == "Params":
+    elif test_type == 'Params':
         q = f"{key}={unique}"
-        sep = "&" if parsed.query else "?"
-        poisoned_url = url + sep + q
+        poisoned_url = url + ('&' if parsed.query else '?') + q
         poisoned_desc = poisoned_url
-    elif test_type == "with-paths" and variation_func:
-        poisoned_parsed = variation_func(parsed)
-        poisoned_base = poisoned_parsed.geturl()
+    elif test_type == 'with-paths':
+        poisoned_base = variation_func(parsed)
         q = f"test={unique}"
         p_parsed = urlparse(poisoned_base)
-        sep = "&" if p_parsed.query else "?"
-        poisoned_url = poisoned_base + sep + q
-        poisoned_desc = f"{url} {key.replace('_', '-')}"
+        poisoned_url = poisoned_base + ('&' if p_parsed.query else '?') + q
+        poisoned_desc = f"{url} {key.replace('append_', '/').replace('_', '-')}"
 
-    result["poisoned_url"] = poisoned_url
-    result["extra_headers"] = extra_h
-
-    print(f"testing-{test_type} : {poisoned_desc} ... ", end="", flush=True)
-
-    # 1. Baseline
+    result['poisoned_url'] = poisoned_url
+    result['extra_headers'] = extra_h
+    print(f"testing-{test_type} : {poisoned_desc} ...", end=' ')
     resp_base = make_request(url)
-    time.sleep(DELAY_BETWEEN)
+    time.sleep(args.delay)
     if not resp_base:
         print("request failed")
         return result, False
-
-    hash_base = body_fingerprint(resp_base)
-
-    # 2. Poisoned request
+    hash_base = body_hash(resp_base)
+    cdn = detect_cdn(resp_base.headers)
+    result['cdn'] = cdn
     resp_poison = make_request(poisoned_url, extra_h)
-    time.sleep(DELAY_BETWEEN)
+    time.sleep(args.delay)
     if not resp_poison:
         print("request failed")
         return result, False
-
-    # 3. Clean request after poison attempt
     resp_clean = make_request(url)
-    time.sleep(DELAY_BETWEEN)
+    time.sleep(args.delay)
     if not resp_clean:
         print("request failed")
         return result, False
-
-    hash_clean = body_fingerprint(resp_clean)
-    cache_ind = get_cache_indicators(resp_clean.headers)
-    cache_status = "HIT" if looks_cached(resp_clean.headers) else "MISS/UNKNOWN"
-
-    reflected = unique in (resp_clean.text or "")
+    hash_clean = body_hash(resp_clean)
+    cache_headers_clean = get_cache_headers(resp_clean)
+    cache_status_clean = get_cache_status(cache_headers_clean)
+    reflected = unique in (resp_clean.text or '')
     hash_changed = hash_clean != hash_base
-
     result.update({
-        "cache_status": cache_status,
-        "reflected": reflected,
-        "hash_changed": hash_changed,
-        "status_code": resp_clean.status_code,
-        "cache_headers": cache_ind
+        'cache_status': cache_status_clean,
+        'reflected': reflected,
+        'hash_changed': hash_changed,
+        'status_code': resp_clean.status_code,
+        'cache_headers': cache_headers_clean
     })
-
-    is_suspect = (reflected or hash_changed) and cache_status == "HIT"
-
+    is_suspect = (reflected or hash_changed) and cache_status_clean in ('HIT', 'MISS')
     if is_suspect:
         print("bounty")
         print(f"\033[41mHere is your bounty: Cache poisoning hit using {test_type} {key}\033[0m")
@@ -184,165 +525,99 @@ def perform_test(url: str, test_type: str, key: str = "", variation_func=None) -
             print(f"With headers: {extra_h}")
         print(f"Unique poison: {unique}")
         print("Steps to reproduce:")
-        print(f"  1. GET {url}")
-        print(f"  2. GET {poisoned_url}" + (f"   with {extra_h}" if extra_h else ""))
-        print(f"  3. GET {url} again → reflection/change of {unique}")
+        print(f"1. GET {url}")
+        print(f"2. GET {poisoned_url}" + (f" with {extra_h}" if extra_h else ""))
+        print(f"3. GET {url} again - check for change or reflection of {unique}")
     else:
         print("no-here")
-
     return result, is_suspect
 
-
-def check_default_caching(url: str) -> Tuple[str, bool]:
-    print(f"testing-with-nothing : {url} ... ", end="", flush=True)
-
-    r1 = make_request(url)
-    time.sleep(DELAY_BETWEEN)
-    if not r1:
+def check_default_caching(url):
+    print(f"testing-with-nothing : {url} ...", end=' ')
+    resp1 = make_request(url)
+    time.sleep(args.delay)
+    if not resp1:
         print("request failed")
-        return "UNKNOWN", False
-
-    r2 = make_request(url)
-    time.sleep(DELAY_BETWEEN)
-    if not r2:
+        return 'UNKNOWN', False
+    resp2 = make_request(url)
+    time.sleep(args.delay)
+    if not resp2:
         print("request failed")
-        return "UNKNOWN", False
-
-    cached = looks_cached(r2.headers)
-    status = "HIT" if cached else "MISS/UNKNOWN"
-
-    if cached:
+        return 'UNKNOWN', False
+    cache_status2 = get_cache_status(get_cache_headers(resp2))
+    is_hit = cache_status2 == 'HIT'
+    if is_hit:
         print("hit (default cache)")
     else:
         print("no-here")
+    return cache_status2, is_hit
 
-    return status, cached
-
-
-def process_single_url(url: str, args) -> list:
-    print(f"\n{'='*80}")
+def process_url(url):
     print(f"[Starting analysis for URL: {url}]")
-    print(f"{'='*80}\n")
-
+    print("================================================================================")
     results = []
-
     try:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             print(f"\033[31m[INVALID URL] {url}\033[0m")
-            return results
-    except Exception:
+            return []
+    except:
         print(f"\033[31m[INVALID URL] {url}\033[0m")
-        return results
-
-    # Check if the target even supports default caching
-    _, default_cached = check_default_caching(url)
-    # Note: we continue even if cached — goal is poisoning, not just caching
-
-    # Headers
-    for header in HEADERS_TO_TEST:
-        res, suspect = perform_test(url, "Headers", key=header)
-        results.append(res)
-        if suspect and not args.continue_after_find:
-            return results
-
-    # Query parameters
-    for param in PARAMS_TO_TEST:
-        res, suspect = perform_test(url, "Params", key=param)
-        results.append(res)
-        if suspect and not args.continue_after_find:
-            return results
-
-    # Path variations
-    for name, func in PATH_VARIATIONS.items():
-        res, suspect = perform_test(url, "with-paths", key=name, variation_func=func)
-        results.append(res)
-        if suspect and not args.continue_after_find:
-            return results
-
-    print(f"\n[Analysis complete for {url}]")
-    print(f"{'='*80}\n")
-
+        return []
+    default_cache, is_suspect = check_default_caching(url)
+    if is_suspect:
+        print(f"\033[41mHere is your bounty: Default cache hit, but check if poisonable.\033[0m")
+        return results  # Stop if default is suspect, but default isn't poisoning
+    do_headers = not args.params_only
+    do_params = not args.headers_only
+    do_variations = not args.headers_only and not args.params_only
+    if do_headers:
+        for h in headers_to_test:
+            res, suspect = perform_test(url, 'Headers', key=h)
+            results.append(res)
+            if suspect:
+                return results
+    if do_params:
+        for p in params_to_test:
+            res, suspect = perform_test(url, 'Params', key=p)
+            results.append(res)
+            if suspect:
+                return results
+    if do_variations:
+        for v_name, v_func in variations:
+            res, suspect = perform_test(url, 'with-paths', key=v_name, variation_func=v_func)
+            results.append(res)
+            if suspect:
+                return results
+    print(f"[Analysis complete for {url}]")
+    print("================================================================================")
     return results
 
+all_results = []
+cache_hits = set()
+cache_suspect = set()
 
-def main():
-    parser = argparse.ArgumentParser(description="Web Cache Poisoning / Deception Scanner")
-    parser.add_argument("--file", "-f", help="File with one URL per line")
-    parser.add_argument("--url", "-u", help="Single URL to test")
-    parser.add_argument("--threads", "-n", type=int, default=5, help="Number of concurrent targets")
-    parser.add_argument("--delay", type=float, default=0.6, help="Delay between requests (seconds)")
-    parser.add_argument("--output", "-o", default="cache_scan_results.json", help="JSON results file")
-    parser.add_argument("--cache-hits", default="cache_hits.txt", help="List of URLs with cache hits")
-    parser.add_argument("--suspect", default="suspect_urls.txt", help="Potentially poisoned URLs")
-    parser.add_argument("--continue", dest="continue_after_find", action="store_true",
-                        help="Continue testing even after finding a suspect case")
-    args = parser.parse_args()
+with ThreadPoolExecutor(max_workers=args.threads) as executor:
+    futures = [executor.submit(process_url, u) for u in urls]
+    for future in as_completed(futures):
+        res_list = future.result()
+        for res in res_list:
+            all_results.append(res)
+            u = res['url']
+            if res['cache_status'] == 'HIT':
+                cache_hits.add(u)
+            if res['reflected'] or res['hash_changed']:
+                if res['cache_status'] == 'HIT':
+                    cache_suspect.add(u)
 
-    global DELAY_BETWEEN
-    DELAY_BETWEEN = args.delay
+with open('full_results.json', 'w') as f:
+    json.dump(all_results, f, indent=4)
 
-    urls = []
-    if args.url:
-        urls = [args.url.strip()]
-    elif args.file:
-        try:
-            with open(args.file, encoding="utf-8") as f:
-                urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-        except Exception as e:
-            print(f"Error reading file: {e}")
-            return
-    else:
-        parser.print_help()
-        return
+with open('cache_hits.txt', 'w') as f:
+    for u in sorted(cache_hits):
+        f.write(u + '\n')
 
-    if not urls:
-        print("No URLs provided.")
-        return
-
-    print(f"\nStarting scan of {len(urls)} URL(s) with {args.threads} threads ...\n")
-
-    all_results = []
-    cache_hits = set()
-    suspects = set()
-
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_to_url = {executor.submit(process_single_url, u, args): u for u in urls}
-        for future in as_completed(future_to_url):
-            try:
-                res_list = future.result()
-                all_results.extend(res_list)
-                for r in res_list:
-                    if r.get("cache_status") == "HIT":
-                        cache_hits.add(r["url"])
-                    if r.get("reflected") or r.get("hash_changed"):
-                        if r.get("cache_status") == "HIT":
-                            suspects.add(r["url"])
-            except Exception as exc:
-                url = future_to_url[future]
-                print(f"Thread for {url} generated an exception: {exc}")
-
-    # Save results
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
-
-    with open(args.cache_hits, "w", encoding="utf-8") as f:
-        for u in sorted(cache_hits):
-            f.write(u + "\n")
-
-    with open(args.suspect, "w", encoding="utf-8") as f:
-        f.write("Potentially vulnerable to cache poisoning / deception:\n")
-        for u in sorted(suspects):
-            f.write(u + "\n")
-
-    print(f"\nScan finished.")
-    print(f"  Results:        {args.output}")
-    print(f"  Cache hits:     {args.cache_hits} ({len(cache_hits)})")
-    print(f"  Suspect URLs:   {args.suspect}   ({len(suspects)})")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+with open('cache_suspect.txt', 'w') as f:
+    f.write("Potentially vulnerable URLs to cache poisoning / deception:\n")
+    for u in sorted(cache_suspect):
+        f.write(u + '\n')
