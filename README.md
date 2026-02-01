@@ -46,25 +46,42 @@ https://example.com/blog/post-123
 ```
 Then run:
 ```
-# Basic scan (5 threads)
-python cache_scanner.py -f targets.txt -n 5
+# Basic scan (default 5 threads)
+python cache_scanner.py -f targets.txt
 
-# Slower but safer (more delay between requests)
-python cache_scanner.py -f targets.txt --delay 1.5 -n 4
+# Faster scanning
+python cache_scanner.py -f targets.txt -n 12 --delay 0.4
 
-# Continue testing even after finding issues
-python cache_scanner.py -f targets.txt --continue
+# Safer / more polite scanning
+python cache_scanner.py -f targets.txt --delay 1.8 -n 4 --continue
+
+# Custom output filenames
+python cache_scanner.py -f targets.txt \
+  --continue \
+  --output results-batch-2026.json \
+  --cache-hits cached-2026.txt \
+  --suspect suspects-2026.txt
+
 ```
 Available options
 ```
---file, -f      File with URLs (one per line)
---url, -u       Single URL to test
---threads, -n   Number of concurrent targets (default: 5)
---delay         Seconds between requests to same target (default: 0.6)
---output        JSON results file (default: cache_scan_results.json)
---cache-hits    File for cached URLs (default: cache_hits.txt)
---suspect       File for potentially vulnerable URLs (default: suspect_urls.txt)
---continue      Keep testing after finding a suspect case
+--file,  -f FILE       File with URLs (one per line)
+--url,   -u URL        Single URL to test
+
+--threads, -n N        Number of concurrent targets (default: 5)
+--delay SECONDS        Seconds between requests to the same target (default: 0.6)
+--timeout SECONDS      Request timeout (default: 30)
+
+--output FILE          JSON results file (default: cache_scan_results.json)
+--cache-hits FILE      File for URLs that appear cached / HIT (default: cache_hits.txt)
+--suspect FILE         File for potentially vulnerable URLs (default: suspect_urls.txt)
+
+--continue             Keep testing after finding a suspect / bounty case
+
+--headers-only         Only test header-based poisoning
+--params-only          Only test query parameter poisoning
+
+--user-agent STRING    Custom User-Agent header
 ```
 Example Output
 ```
