@@ -88,7 +88,7 @@ else:
 print(f"[*] Loaded {len(urls)} URL(s) to scan")
 
 # ───────────────────────────────────────────────
-#  Your original cache-related headers & logic
+#  You can add cache-related headers & logic
 # ───────────────────────────────────────────────
 
 cache_headers = [
@@ -146,7 +146,7 @@ def detect_cdn(headers):
     return 'Unknown'
 
 # ───────────────────────────────────────────────
-#  Your original headers / params / variations
+#  You can add headers / params / variations
 # ───────────────────────────────────────────────
 
 user_agent = args.user_agent
@@ -173,13 +173,19 @@ params_to_test = [
     'callback'
 ]
 
+from urllib.parse import urljoin, quote
+
 variations = [
+    # Generic syntax / normalization tricks
     ('trailing_slash_add', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/')),
     ('trailing_slash_remove', lambda p: urljoin(p.geturl(), p.path.rstrip('/'))),
     ('double_slash', lambda p: p._replace(path=p.path.replace('/', '//', 1)).geturl()),
     ('encoded_slash', lambda p: p._replace(path=quote(p.path, safe='')).geturl()),
     ('upper_path', lambda p: p._replace(path=p.path.upper()).geturl()),
     ('path_param_semicolon', lambda p: urljoin(p.geturl(), p.path + ';test=1')),
+    ('append_many_slashes', lambda p: p._replace(path=p.path + '///').geturl()),
+
+    # Common file extensions / backups
     ('append_js', lambda p: p._replace(path=p.path.rstrip('/') + '.js').geturl()),
     ('append_css', lambda p: p._replace(path=p.path.rstrip('/') + '.css').geturl()),
     ('append_json', lambda p: p._replace(path=p.path.rstrip('/') + '.json').geturl()),
@@ -190,25 +196,6 @@ variations = [
     ('append_bak', lambda p: p._replace(path=p.path.rstrip('/') + '.bak').geturl()),
     ('append_old', lambda p: p._replace(path=p.path.rstrip('/') + '.old').geturl()),
     ('append_backup', lambda p: p._replace(path=p.path.rstrip('/') + '.backup').geturl()),
-    ('append_admin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/admin')),
-    ('append_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data')),
-    ('append_page_data_json', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data.json')),
-    ('append_dash_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data/')),
-    ('append_backup', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/backup')),
-    ('append_config', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/config')),
-    ('append_debug', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/debug')),
-    ('append_api', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/api')),
-    ('append_login', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/login')),
-    ('append_fake_css', lambda p: p._replace(path=p.path + '/fake.css').geturl()),
-    ('append_fake_js', lambda p: p._replace(path=p.path + '/nonexistent.js').geturl()),
-    ('append_style_css', lambda p: p._replace(path=p.path + '/style.css').geturl()),
-    ('append_main_js', lambda p: p._replace(path=p.path + '/main.js').geturl()),
-    ('append_index_html', lambda p: p._replace(path=p.path + '/index.html').geturl()),
-    ('append_extra_dir', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/extra/')),
-    ('append_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/../')),
-    ('append_encoded_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/%2e%2e/')),
-    ('append_many_slashes', lambda p: p._replace(path=p.path + '///').geturl()),
-    ('append_admin_css', lambda p: p._replace(path=p.path.rstrip('/') + '/admin.css').geturl()),
     ('append_backup_json', lambda p: p._replace(path=p.path.rstrip('/') + '/backup.json').geturl()),
     ('append_config_yaml', lambda p: p._replace(path=p.path.rstrip('/') + '/config.yaml').geturl()),
     ('append_env', lambda p: p._replace(path=p.path.rstrip('/') + '/.env').geturl()),
@@ -217,12 +204,26 @@ variations = [
     ('append_robots_txt', lambda p: p._replace(path=p.path.rstrip('/') + '/robots.txt').geturl()),
     ('append_test_php', lambda p: p._replace(path=p.path.rstrip('/') + '/test.php').geturl()),
     ('append_index_php', lambda p: p._replace(path=p.path.rstrip('/') + '/index.php').geturl()),
+    ('append_db_dump', lambda p: p._replace(path=p.path.rstrip('/') + '/db_dump.sql').geturl()),
+    ('append_manifest_json', lambda p: p._replace(path=p.path.rstrip('/') + '/manifest.json').geturl()),
+    ('append_sw_js', lambda p: p._replace(path=p.path.rstrip('/') + '/sw.js').geturl()),
+    ('append_favicon_ico', lambda p: p._replace(path=p.path.rstrip('/') + '/favicon.ico').geturl()),
+    ('append_apple_touch_icon', lambda p: p._replace(path=p.path.rstrip('/') + '/apple-touch-icon.png').geturl()),
+
+    # Common fake / internal paths
+    ('append_admin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/admin')),
     ('append_wp_admin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/wp-admin')),
+    ('append_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data')),
+    ('append_page_data_json', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data.json')),
+    ('append_dash_page_data', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-data/')),
+    ('append_api', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/api')),
+    ('append_login', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/login')),
     ('append_dashboard', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/dashboard')),
     ('append_profile', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/profile')),
     ('append_settings', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/settings')),
     ('append_logs', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/logs')),
-    ('append_db_dump', lambda p: p._replace(path=p.path.rstrip('/') + '/db_dump.sql').geturl()),
+    ('append_config', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/config')),
+    ('append_debug', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/debug')),
     ('append_cache', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/cache')),
     ('append_static', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/static')),
     ('append_assets', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/assets')),
@@ -232,12 +233,28 @@ variations = [
     ('append_fonts', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/fonts')),
     ('append_vendor', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/vendor')),
     ('append_node_modules', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/node_modules')),
+
+    # Fake / poisoned paths (your main interest)
+    ('append_fake_css', lambda p: p._replace(path=p.path + '/fake.css').geturl()),
+    ('append_fake_js', lambda p: p._replace(path=p.path + '/nonexistent.js').geturl()),
+    ('append_style_css', lambda p: p._replace(path=p.path + '/style.css').geturl()),
+    ('append_main_js', lambda p: p._replace(path=p.path + '/main.js').geturl()),
+    ('append_index_html', lambda p: p._replace(path=p.path + '/index.html').geturl()),
+    ('append_extra_dir', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/extra/')),
+    ('append_page_bata', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-bata')),
+    ('append_admin_poison_xxx', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/admin/poison_xxx')),
+    ('append_page_bata_poison_query', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/page-bata?poison=xxx')),
+    ('append_fakeadmin', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/fakeadmin/')),
+    ('append_fakeadmin_poison_query', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/fakeadmin?poison=xxx')),
+    ('append_poison_xxx', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/poison_xxx')),
+    ('append_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/../')),
+    ('append_encoded_dotdot', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/%2e%2e/')),
+    ('append_dotdot_poison', lambda p: urljoin(p.geturl(), p.path.rstrip('/') + '/../poison_xxx')),
+
+    # Less common but useful
+    ('append_admin_css', lambda p: p._replace(path=p.path.rstrip('/') + '/admin.css').geturl()),
     ('append_composer_json', lambda p: p._replace(path=p.path.rstrip('/') + '/composer.json').geturl()),
     ('append_package_json', lambda p: p._replace(path=p.path.rstrip('/') + '/package.json').geturl()),
-    ('append_manifest_json', lambda p: p._replace(path=p.path.rstrip('/') + '/manifest.json').geturl()),
-    ('append_sw_js', lambda p: p._replace(path=p.path.rstrip('/') + '/sw.js').geturl()),
-    ('append_favicon_ico', lambda p: p._replace(path=p.path.rstrip('/') + '/favicon.ico').geturl()),
-    ('append_apple_touch_icon', lambda p: p._replace(path=p.path.rstrip('/') + '/apple-touch-icon.png').geturl()),
 ]
 
 additional_suffixes = [
